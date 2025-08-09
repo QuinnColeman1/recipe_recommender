@@ -1,0 +1,5 @@
+data/full_dataset.csv
+data/recipes.db
+__pycache__/
+*.pyc
+.venv/
