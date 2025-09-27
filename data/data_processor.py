@@ -1,14 +1,74 @@
 import duckdb
 import pandas as pd
 import re
+import numpy as np
 from pathlib import Path
 import warnings
+import time
+import argparse
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import gc  # For garbage collection
 warnings.filterwarnings('ignore')
+
+# Compile regex patterns once
+QUANTITY_PATTERN = re.compile(
+    r'\b\d+[\s\-]*(?:\d+/\d+)?[\s\-]*(?:cups?|tbsp?|tsp?|tablespoons?|teaspoons?|oz|ounces?|lbs?|pounds?|g|grams?|kg|ml|liters?)\b',
+    flags=re.IGNORECASE
+)
+PREP_WORDS = re.compile(
+    r'\b(?:chopped|diced|sliced|minced|crushed|ground|grated|shredded|melted|softened|fresh|frozen|dried|canned|optional|to taste|or more|as needed)\b',
+    flags=re.IGNORECASE
+)
+PARENTHESES = re.compile(r'\([^)]*\)')
+NUMBER_PREFIX = re.compile(r'^\d+[\s\-]*(?:\d+/\d+)?[\s\-]*')
+WHITESPACE = re.compile(r'\s+')
+
+# Standalone functions for multiprocessing
+def clean_single_ingredient_standalone(ingredient):
+    """Standalone version of clean_single_ingredient for multiprocessing"""
+    if not ingredient:
+        return None
+        
+    # Convert to string and clean
+    ingredient = str(ingredient).strip(' \"\'')
+    if len(ingredient) < 2:
+        return None
+        
+    # Remove quantities and measurements
+    ingredient = QUANTITY_PATTERN.sub('', ingredient)
+    
+    # Remove numbers at the beginning
+    ingredient = NUMBER_PREFIX.sub('', ingredient)
+    
+    # Remove parentheses content
+    ingredient = PARENTHESES.sub('', ingredient)
+    
+    # Remove common preparation words
+    ingredient = PREP_WORDS.sub('', ingredient)
+    
+    # Clean up whitespace and convert to lowercase
+    ingredient = WHITESPACE.sub(' ', ingredient).strip(' ,-.').lower()
+    
+    # Skip if too short or just numbers
+    if len(ingredient) < 2 or ingredient.isdigit():
+        return None
+        
+    return ingredient
+
+def process_ingredient_batch_standalone(ingredients_list):
+    """Standalone version for multiprocessing"""
+    return [ing for ing in map(clean_single_ingredient_standalone, ingredients_list) if ing]
 
 class SimpleRecipeProcessor:
     def __init__(self, db_path='recipes.db'):
         """Initialize with DuckDB only - no ML dependencies"""
-        self.con = duckdb.connect(db_path)
+        # Use a more conservative memory configuration for DuckDB
+        self.con = duckdb.connect(db_path, config={
+            'memory_limit': '1GB',  # Limit DuckDB memory usage
+            'threads': 4  # Limit thread usage
+        })
         
         # Define ingredient blacklists for dietary classification
         self.meat_keywords = [
@@ -52,90 +112,149 @@ class SimpleRecipeProcessor:
             )
         """)
     
-    def load_data_from_csv(self, csv_path):
-        """Load CSV data into DuckDB"""
+    def load_data_from_csv(self, csv_path, limit=None):
+        """Load CSV data into DuckDB efficiently without loading all into memory"""
         print(f"Loading data from {csv_path}...")
         
-        # Use DuckDB's fast CSV reader
-        self.con.execute(f"""
-            CREATE OR REPLACE TABLE raw_recipes AS 
-            SELECT * FROM read_csv_auto('{csv_path}')
-        """)
+        # First, get column names from a small sample
+        sample_df = pd.read_csv(csv_path, nrows=5)
+        sample_df.columns = sample_df.columns.str.strip().str.lower()
         
-        # Get basic stats
+        # Ensure required columns exist
+        required_columns = {'title', 'ingredients', 'directions'}
+        missing_columns = required_columns - set(sample_df.columns)
+        if missing_columns:
+            raise ValueError(f"CSV is missing required columns: {', '.join(missing_columns)}")
+        
+        print(f"Available columns: {', '.join(sample_df.columns)}")
+        
+        try:
+            # Method 1: Use DuckDB's efficient CSV reader
+            # This reads the CSV directly without loading it all into memory
+            limit_clause = f"LIMIT {limit}" if limit else ""
+            
+            # Create the raw_recipes table directly from CSV
+            self.con.execute(f"""
+                CREATE OR REPLACE TABLE raw_recipes AS 
+                SELECT * FROM read_csv_auto(
+                    '{csv_path}',
+                    header=true,
+                    sample_size=10000,
+                    all_varchar=false,
+                    normalize_names=true
+                ) {limit_clause}
+            """)
+            
+        except Exception as e:
+            print(f"DuckDB direct CSV reading failed: {e}")
+            print("Falling back to chunked pandas reading...")
+            
+            # Method 2: Fallback to chunked pandas reading
+            chunk_size = 50000
+            chunks_processed = 0
+            
+            # Create table from first chunk to get schema
+            first_chunk = True
+            
+            for chunk in pd.read_csv(csv_path, chunksize=chunk_size):
+                # Normalize column names
+                chunk.columns = chunk.columns.str.strip().str.lower()
+                
+                if first_chunk:
+                    # Create table with first chunk
+                    self.con.register('temp_chunk', chunk)
+                    self.con.execute("""
+                        CREATE OR REPLACE TABLE raw_recipes AS 
+                        SELECT * FROM temp_chunk
+                    """)
+                    first_chunk = False
+                else:
+                    # Append subsequent chunks
+                    self.con.register('temp_chunk', chunk)
+                    self.con.execute("""
+                        INSERT INTO raw_recipes
+                        SELECT * FROM temp_chunk
+                    """)
+                
+                chunks_processed += len(chunk)
+                print(f"Loaded {chunks_processed:,} recipes...", end='\r')
+                
+                # Stop if we've reached the limit
+                if limit and chunks_processed >= limit:
+                    # Trim to exact limit if we went over
+                    if chunks_processed > limit:
+                        self.con.execute(f"""
+                            DELETE FROM raw_recipes 
+                            WHERE rowid > {limit}
+                        """)
+                    break
+        
+        # Get the count of loaded records
         count = self.con.execute("SELECT COUNT(*) FROM raw_recipes").fetchone()[0]
-        print(f"Loaded {count} recipes into DuckDB")
+        print(f"\nLoaded {count:,} recipes into DuckDB")
+        
+        # Normalize column names to lowercase
+        columns = self.con.execute("SELECT * FROM raw_recipes LIMIT 1").description
+        for col in columns:
+            col_name = col[0]
+            if col_name != col_name.lower():
+                try:
+                    self.con.execute(f'ALTER TABLE raw_recipes RENAME COLUMN "{col_name}" TO {col_name.lower()}')
+                except:
+                    pass  # Column might already be lowercase
         
         return count
     
-    def clean_ingredient_string(self, ingredient_text):
-        """Clean and parse ingredient string using simple regex"""
-        if pd.isna(ingredient_text) or not ingredient_text:
-            return []
+    def clean_ingredient_string_batch(self, ingredients_series, use_multiprocessing=False):
+        """Clean and parse ingredient strings in batch"""
+        if ingredients_series.empty:
+            return pd.Series([[]] * len(ingredients_series))
         
-        # Convert to string and handle different formats
-        ingredient_text = str(ingredient_text).strip('[]"\'')
+        # Convert to string and clean
+        ingredients = ingredients_series.astype(str).str.strip('[]\"\'')
         
         # Split by common delimiters
-        if ',' in ingredient_text:
-            raw_ingredients = ingredient_text.split(',')
-        elif ';' in ingredient_text:
-            raw_ingredients = ingredient_text.split(';')
+        split_ingredients = []
+        for text in ingredients:
+            if ',' in text:
+                parts = [p.strip() for p in text.split(',') if p.strip()]
+            elif ';' in text:
+                parts = [p.strip() for p in text.split(';') if p.strip()]
+            else:
+                parts = re.findall(r'"([^"]*)"', text) or [text]
+            split_ingredients.append(parts)
+        
+        # Process ingredients
+        if use_multiprocessing and len(split_ingredients) > 100:
+            # Only use multiprocessing for larger batches
+            try:
+                with ProcessPoolExecutor(max_workers=min(4, multiprocessing.cpu_count())) as executor:
+                    cleaned_ingredients = list(tqdm(
+                        executor.map(process_ingredient_batch_standalone, split_ingredients),
+                        total=len(split_ingredients),
+                        desc="Cleaning ingredients (parallel)"
+                    ))
+            except Exception as e:
+                print(f"Multiprocessing failed: {e}, falling back to serial processing")
+                cleaned_ingredients = [
+                    process_ingredient_batch_standalone(ingredients_list) 
+                    for ingredients_list in tqdm(split_ingredients, desc="Cleaning ingredients (serial)")
+                ]
         else:
-            # Try to split by quotes if it looks like a list
-            raw_ingredients = re.findall(r'"([^"]*)"', ingredient_text)
-            if not raw_ingredients:
-                raw_ingredients = [ingredient_text]
+            # For smaller batches, process serially (faster due to overhead)
+            cleaned_ingredients = [
+                process_ingredient_batch_standalone(ingredients_list) 
+                for ingredients_list in tqdm(split_ingredients, desc="Cleaning ingredients")
+            ]
         
-        clean_ingredients = []
-        for ingredient in raw_ingredients:
-            cleaned = self.clean_single_ingredient(ingredient)
-            if cleaned:
-                clean_ingredients.append(cleaned)
-        
-        return clean_ingredients
+        return pd.Series(cleaned_ingredients)
     
     def clean_single_ingredient(self, ingredient):
         """Clean a single ingredient string"""
-        if not ingredient:
-            return None
-            
-        ingredient = str(ingredient).strip(' "\'')
-        
-        # Remove quantities and measurements
-        ingredient = re.sub(
-            r'\b\d+[\s\-]*(?:\d+/\d+)?[\s\-]*(?:cups?|tbsp?|tsp?|tablespoons?|teaspoons?|oz|ounces?|lbs?|pounds?|g|grams?|kg|ml|liters?)\b',
-            '', ingredient, flags=re.IGNORECASE
-        )
-        
-        # Remove numbers at the beginning
-        ingredient = re.sub(r'^\d+[\s\-]*(?:\d+/\d+)?[\s\-]*', '', ingredient)
-        
-        # Remove parentheses content
-        ingredient = re.sub(r'\([^)]*\)', '', ingredient)
-        
-        # Remove common preparation words
-        prep_words = [
-            'chopped', 'diced', 'sliced', 'minced', 'crushed', 'ground',
-            'grated', 'shredded', 'melted', 'softened', 'fresh', 'frozen',
-            'dried', 'canned', 'optional', 'to taste', 'or more', 'as needed'
-        ]
-        
-        for word in prep_words:
-            ingredient = re.sub(r'\b' + word + r'\b', '', ingredient, flags=re.IGNORECASE)
-        
-        # Clean up whitespace and convert to lowercase
-        ingredient = re.sub(r'\s+', ' ', ingredient).strip(' ,-.')
-        ingredient = ingredient.lower()
-        
-        # Skip if too short or just numbers
-        if len(ingredient) < 2 or ingredient.isdigit():
-            return None
-        
-        return ingredient
+        return clean_single_ingredient_standalone(ingredient)
     
     def classify_dietary_simple(self, ingredients_list):
-        """Simple keyword-based dietary classification"""
+        """Optimized keyword-based dietary classification"""
         if not ingredients_list:
             return {
                 'is_vegetarian': True,
@@ -146,15 +265,29 @@ class SimpleRecipeProcessor:
         # Join all ingredients into one text for easier searching
         ingredients_text = ' '.join(ingredients_list).lower()
         
-        # Check for meat/fish
-        has_meat = any(meat in ingredients_text for meat in self.meat_keywords)
+        # Use set for faster lookups
+        ingredients_set = set(ingredients_list)
+        
+        # Check for meat/fish using set intersection for exact matches
+        has_meat = any(meat in ingredients_set for meat in self.meat_keywords)
+        
+        # If no exact matches, fall back to substring search
+        if not has_meat:
+            has_meat = any(meat in ingredients_text for meat in self.meat_keywords)
         
         # Check for dairy/eggs
         has_dairy = any(dairy in ingredients_text for dairy in self.dairy_egg_keywords)
         
-        # Check for dessert indicators
-        dessert_count = sum(1 for dessert in self.dessert_keywords if dessert in ingredients_text)
-        is_dessert = dessert_count >= 2  # Need multiple dessert keywords
+        # Check for dessert indicators with early exit
+        dessert_count = 0
+        for dessert in self.dessert_keywords:
+            if dessert in ingredients_text:
+                dessert_count += 1
+                if dessert_count >= 2:  # Early exit if we find enough dessert indicators
+                    is_dessert = True
+                    break
+        else:
+            is_dessert = dessert_count >= 2
         
         return {
             'is_vegetarian': not has_meat,
@@ -198,83 +331,157 @@ class SimpleRecipeProcessor:
         
         return None
     
-    def process_recipes_batch(self, batch_size=10000):
-        """Process recipes in batches using simple text processing"""
-        print("Processing recipes with simple text processing...")
+    def process_recipes_batch(self, batch_size=50000, limit=None):
+        """Process recipes in batches using optimized text processing"""
+        print("Starting recipe processing...")
+        start_time = time.time()
         
         # Get total count
         total_count = self.con.execute("SELECT COUNT(*) FROM raw_recipes").fetchone()[0]
-        print(f"Processing {total_count} recipes in batches of {batch_size}")
+        print(f"Processing {total_count:,} recipes in batches of {batch_size:,}")
+        
+        # Since we may have already limited at load time, use the actual count
+        # The limit was already applied during load_data_from_csv
+        
+        # Calculate total batches
+        total_batches = (total_count + batch_size - 1) // batch_size
         
         # Process in batches
-        for offset in range(0, total_count, batch_size):
-            print(f"Processing batch {offset//batch_size + 1}/{(total_count + batch_size - 1)//batch_size}")
+        for batch_num in tqdm(range(total_batches), desc="Processing batches"):
+            offset = batch_num * batch_size
+            batch_start = time.time()
             
-            # Get batch data
+            # Get batch data with explicit column selection
             batch_df = self.con.execute(f"""
-                SELECT * FROM raw_recipes 
+                SELECT 
+                    *,
+                    ROW_NUMBER() OVER () as row_id
+                FROM raw_recipes 
+                ORDER BY row_id
                 LIMIT {batch_size} OFFSET {offset}
             """).fetchdf()
             
-            # Process each recipe in batch
-            processed_batch = []
-            
-            for idx, row in batch_df.iterrows():
-                # Extract and clean ingredients
-                clean_ingredients = self.clean_ingredient_string(row.get('ingredients', ''))
+            if batch_df.empty:
+                continue
                 
-                # Classify dietary restrictions
-                dietary_info = self.classify_dietary_simple(clean_ingredients)
-                
-                # Extract cooking time
-                cooking_time = self.extract_cooking_time(row.get('directions', ''))
-                
-                processed_batch.append({
-                    'recipe_id': row.get('recipe_id', idx) or idx,
-                    'title': row.get('title', '') or '',
-                    'ingredients': row.get('ingredients', '') or '',
-                    'directions': row.get('directions', '') or '',
-                    'rating': float(row.get('rating', 0)) if pd.notna(row.get('rating')) else None,
-                    'cuisine_type': row.get('cuisine_type', '') or '',
-                    'ingredients_clean': clean_ingredients,
-                    'ingredient_count': len(clean_ingredients),
-                    'cooking_time': cooking_time,
-                    'is_vegetarian': dietary_info['is_vegetarian'],
-                    'is_vegan': dietary_info['is_vegan'],
-                    'is_dessert': dietary_info['is_dessert']
-                })
+            # Ensure we have the required columns
+            if 'ingredients' not in batch_df.columns:
+                raise ValueError("'ingredients' column not found in the batch data. Available columns: " + 
+                               ", ".join(batch_df.columns))
             
-            # Insert batch into processed table
-            processed_df = pd.DataFrame(processed_batch)
+            # Process ingredients in batch (use multiprocessing only for larger batches)
+            # Disable multiprocessing for small batches to avoid overhead
+            use_mp = len(batch_df) > 1000 and batch_size > 1000
+            batch_df['ingredients_clean'] = self.clean_ingredient_string_batch(
+                batch_df['ingredients'], 
+                use_multiprocessing=use_mp
+            )
+            batch_df['ingredient_count'] = batch_df['ingredients_clean'].apply(len)
             
-            # Insert batch directly using parameterized queries to avoid type issues
-            for recipe in processed_batch:
-                try:
-                    self.con.execute("""
-                        INSERT OR REPLACE INTO recipes (
-                            recipe_id, title, ingredients, directions, rating, 
-                            cuisine_type, ingredients_clean, ingredient_count, 
-                            cooking_time, is_vegetarian, is_vegan, is_dessert
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        recipe['recipe_id'],
-                        recipe['title'],
-                        recipe['ingredients'], 
-                        recipe['directions'],
-                        recipe['rating'],
-                        recipe['cuisine_type'],
-                        recipe['ingredients_clean'],
-                        recipe['ingredient_count'],
-                        recipe['cooking_time'],
-                        recipe['is_vegetarian'],
-                        recipe['is_vegan'],
-                        recipe['is_dessert']
-                    ])
-                except Exception as e:
-                    print(f"Error inserting recipe {recipe['recipe_id']}: {e}")
-                    continue
+            # Classify dietary restrictions
+            dietary_info = batch_df['ingredients_clean'].apply(self.classify_dietary_simple)
+            batch_df = pd.concat([
+                batch_df,
+                pd.json_normalize(dietary_info)
+            ], axis=1)
+            
+            # Extract cooking times
+            if 'directions' in batch_df.columns:
+                batch_df['cooking_time'] = batch_df['directions'].apply(self.extract_cooking_time)
+            
+            # Prepare data for insertion - use row_id if 'id' column doesn't exist
+            if 'id' in batch_df.columns:
+                batch_df = batch_df.rename(columns={'id': 'recipe_id'})
+            elif 'row_id' in batch_df.columns:
+                batch_df = batch_df.rename(columns={'row_id': 'recipe_id'})
+            else:
+                batch_df['recipe_id'] = range(offset + 1, offset + 1 + len(batch_df))
+            
+            # Handle missing values
+            batch_df['rating'] = pd.to_numeric(batch_df.get('rating'), errors='coerce')
+            batch_df['cuisine_type'] = batch_df.get('cuisine_type', '')
+            
+            # Insert batch using DuckDB's fast path
+            try:
+                # Create a temporary table for the batch
+                cols_to_insert = ['recipe_id', 'title', 'ingredients', 'directions', 
+                                 'ingredients_clean', 'ingredient_count',
+                                 'cooking_time', 'is_vegetarian', 'is_vegan', 'is_dessert']
+                
+                # Add optional columns if they exist
+                if 'rating' in batch_df.columns:
+                    cols_to_insert.insert(4, 'rating')
+                if 'cuisine_type' in batch_df.columns:
+                    cols_to_insert.insert(5, 'cuisine_type')
+                
+                # Filter to only include columns that exist
+                cols_to_insert = [col for col in cols_to_insert if col in batch_df.columns]
+                
+                self.con.register('temp_batch', batch_df[cols_to_insert])
+                
+                # Build column list for insert
+                insert_cols = ', '.join(cols_to_insert)
+                placeholders = ', '.join(['?' for _ in cols_to_insert])
+                
+                # Use INSERT OR REPLACE to handle duplicates
+                self.con.execute(f"""
+                    INSERT OR REPLACE INTO recipes ({insert_cols})
+                    SELECT {insert_cols} FROM temp_batch
+                """)
+                
+                # Commit after each batch
+                self.con.commit()
+                
+                batch_time = time.time() - batch_start
+                items_per_sec = len(batch_df) / batch_time if batch_time > 0 else 0
+                
+                print(f"\nProcessed batch {batch_num + 1}/{total_batches} "
+                      f"({len(batch_df):,} items, {items_per_sec:.1f} items/sec)")
+                
+            except Exception as e:
+                print(f"\nError processing batch {batch_num + 1}: {str(e)}")
+                # If batch fails, try processing individual records
+                self._process_failed_batch(batch_df)
+            
+            # Always clean up memory after each batch
+            del batch_df
+            gc.collect()
         
-        print("Processing complete!")
+        total_time = time.time() - start_time
+        print(f"\nProcessing complete! Total time: {total_time/60:.1f} minutes")
+        print(f"Average speed: {total_count/total_time:.1f} items/second")
+    
+    def _process_failed_batch(self, batch_df):
+        """Process individual records if batch insert fails"""
+        success = 0
+        for _, row in tqdm(batch_df.iterrows(), total=len(batch_df), desc="Processing failed batch"):
+            try:
+                self.con.execute("""
+                    INSERT OR REPLACE INTO recipes (
+                        recipe_id, title, ingredients, directions, rating, 
+                        cuisine_type, ingredients_clean, ingredient_count, 
+                        cooking_time, is_vegetarian, is_vegan, is_dessert
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    row.get('recipe_id'),
+                    row.get('title', ''),
+                    row.get('ingredients', ''),
+                    row.get('directions', ''),
+                    row.get('rating'),
+                    row.get('cuisine_type', ''),
+                    row.get('ingredients_clean', []),
+                    row.get('ingredient_count', 0),
+                    row.get('cooking_time'),
+                    row.get('is_vegetarian', False),
+                    row.get('is_vegan', False),
+                    row.get('is_dessert', False)
+                ])
+                success += 1
+            except Exception as e:
+                print(f"Error inserting recipe {row.get('recipe_id')}: {e}")
+        
+        if success < len(batch_df):
+            print(f"Warning: Only {success} of {len(batch_df)} records were processed in the failed batch")
     
     def get_statistics(self):
         """Get comprehensive statistics using DuckDB"""
@@ -291,13 +498,13 @@ class SimpleRecipeProcessor:
         """).fetchone()
         
         return {
-            'total_recipes': stats[0],
-            'vegetarian_count': stats[1],
-            'vegan_count': stats[2], 
-            'dessert_count': stats[3],
-            'avg_ingredient_count': stats[4],
-            'avg_cooking_time': stats[5],
-            'recipes_with_time': stats[6]
+            'total_recipes': stats[0] or 0,
+            'vegetarian_count': stats[1] or 0,
+            'vegan_count': stats[2] or 0, 
+            'dessert_count': stats[3] or 0,
+            'avg_ingredient_count': stats[4] or 0,
+            'avg_cooking_time': stats[5] or 0,
+            'recipes_with_time': stats[6] or 0
         }
     
     def validate_classifications(self, sample_size=20):
@@ -339,32 +546,83 @@ class SimpleRecipeProcessor:
         return vegetarian_sample
 
 # Usage example
-if __name__ == "__main__":
-    # Initialize processor
-    processor = SimpleRecipeProcessor()
-    
-    # Load your data
-    csv_path = "full_dataset.csv"  # Update with your path
-    processor.load_data_from_csv(csv_path)
-    
-    # Process with simple text processing
-    processor.process_recipes_batch(batch_size=5000)
-    
-    # Get statistics
-    stats = processor.get_statistics()
-    print("\n=== Processing Statistics ===")
-    for key, value in stats.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.2f}")
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Process recipe data with configurable batch size and limit.')
+    parser.add_argument('--batch-size', type=int, default=10000,
+                       help='Number of recipes to process in each batch (default: 10000)')
+    parser.add_argument('--limit', type=int, default=None,
+                       help='Maximum number of recipes to process in total (default: None, process all)')
+    parser.add_argument('--csv-path', type=str, default=None,
+                       help='Path to the CSV file (default: full_dataset.csv in the same directory)')
+    parser.add_argument('--db-path', type=str, default=None,
+                       help='Path to the output database (default: data/recipes.db)')
+    parser.add_argument('--validate', type=int, default=10,
+                       help='Number of samples to validate (default: 10, set to 0 to skip validation)')
+    return parser.parse_args()
+
+def main():
+    try:
+        args = parse_arguments()
+        
+        # Set up database path
+        if args.db_path is None:
+            import os
+            db_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+            os.makedirs(db_dir, exist_ok=True)
+            db_path = os.path.join(db_dir, 'recipes.db')
         else:
-            print(f"{key}: {value}")
-    
-    # Validate classifications
-    processor.validate_classifications()
-    
-    print("\n=== Simple Recipe Processor Ready! ===")
-    print("Your recipes are now processed with:")
-    print("- Simple ingredient cleaning")
-    print("- Keyword-based dietary classification")
-    print("- Fast DuckDB storage")
-    print("- No ML dependencies!")
+            db_path = args.db_path
+        
+        # Initialize processor
+        print(f"Initializing processor with database: {db_path}")
+        processor = SimpleRecipeProcessor(db_path=db_path)
+        
+        # Set up CSV path
+        if args.csv_path is None:
+            import os
+            csv_path = os.path.join(os.path.dirname(__file__), "full_dataset.csv")
+        else:
+            csv_path = args.csv_path
+            
+        print(f"Loading data from {csv_path}...")
+        # Pass the limit to load_data_from_csv to avoid loading unnecessary data
+        processor.load_data_from_csv(csv_path, limit=args.limit)
+        
+        # Process with optimized text processing
+        print("\nStarting batch processing...")
+        start_time = time.time()
+        
+        # Process with specified batch size and limit
+        print(f"Processing {'all recipes' if args.limit is None else f'up to {args.limit:,} recipes'} "
+              f"in batches of {args.batch_size:,}")
+              
+        processor.process_recipes_batch(batch_size=args.batch_size, limit=args.limit)
+        
+        # Get and display statistics
+        print("\nGenerating statistics...")
+        stats = processor.get_statistics()
+        
+        print("\n=== Processing Statistics ===")
+        for key, value in stats.items():
+            if isinstance(value, float):
+                print(f"{key}: {value:,.2f}")
+            else:
+                print(f"{key}: {value:,}")
+        
+        # Validate a small sample if requested
+        if args.validate > 0:
+            print(f"\nValidating classifications ({args.validate} samples)...")
+            processor.validate_classifications(sample_size=args.validate)
+        
+        total_time = (time.time() - start_time) / 60
+        print(f"\n=== Processing Complete! ===")
+        print(f"Total processing time: {total_time:.1f} minutes")
+        print(f"Average speed: {stats['total_recipes']/(total_time*60):.1f} recipes/second")
+        
+    except Exception as e:
+        print(f"\nError during processing: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
