@@ -1,4 +1,4 @@
-# Recipe Recommender Pro
+# Recipe Recommender
 
 An intelligent recipe recommendation system that helps you discover new recipes based on ingredients you have, dietary preferences, and cooking time constraints.
 
