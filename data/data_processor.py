@@ -163,7 +163,7 @@ def process_csv(
     processed = 0
     next_id = 0
     created = False
-    reader = rel.fetch_record_batch(batch_size)
+    reader = rel.to_arrow_reader(batch_size)
     with ProcessPoolExecutor(max_workers=workers) as pool:
         for batch in reader:
             rows = batch.to_pylist()
@@ -246,6 +246,8 @@ def get_statistics(con: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
         *[share(recipes.field(c)).as_(c) for c in FLAG_COLUMNS],
     )
     row = con.execute(query.get_sql()).fetchone()
+    if row is None:  # an aggregate query always returns one row
+        raise RuntimeError("Statistics query returned no rows")
     names = [d[0] for d in con.description]
     stats = dict(zip(names, row))
     stats["meal_types"] = dict(

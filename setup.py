@@ -8,7 +8,7 @@ setup(
         "pandas>=2.3.1",
         "scikit-learn>=1.7.1",
         "streamlit>=1.47.1",
-        "duckdb>=1.3.2",
+        "duckdb>=1.5",
         "plotly>=5.18.0",
     ],
     python_requires=">=3.11",
