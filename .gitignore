@@ -1,5 +1,19 @@
-data/full_dataset.csv
-data/recipes.db
+# Data: large, generated or downloaded — never commit
+data/*.csv
+*.db
+*.duckdb
+*.db.wal
+*.wal
+data/.duckdb_tmp/
+
+# Python
 __pycache__/
 *.pyc
 .venv/
+
+# Tool caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

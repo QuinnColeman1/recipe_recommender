@@ -6,16 +6,16 @@ from .main import (
     SearchFilters,
     MealType,
     SortBy,
-    DifficultyLevel
+    DifficultyLevel,
 )
 
 # Don't import from streamlit_app here to avoid circular imports
 # Import the functions directly in the test files instead
 
 __all__ = [
-    'EnhancedRecipeRecommender',
-    'SearchFilters',
-    'MealType',
-    'SortBy',
-    'DifficultyLevel'
+    "EnhancedRecipeRecommender",
+    "SearchFilters",
+    "MealType",
+    "SortBy",
+    "DifficultyLevel",
 ]

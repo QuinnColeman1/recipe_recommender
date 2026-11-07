@@ -5,7 +5,7 @@
 # Variables
 PYTHON := poetry run python
 POETRY := poetry run
-SRC_DIRS := streamlit data
+SRC_DIRS := recipe_app data
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -33,6 +33,15 @@ test: ## Run tests with coverage
 	@echo "\n🔍 Running tests..."
 	$(POETRY) pytest tests/ -v --cov=. --cov-report=term-missing --cov-report=html
 
+process-data: ## Clean the first 10k rows of data/full_dataset.csv into data/recipes_dev.db
+	$(PYTHON) -m data.data_processor --limit 10000 --db-path data/recipes_dev.db --overwrite
+
+app-db: ## Build the lean app database (data/recipes_app.db) from data/recipes.db
+	$(PYTHON) -m data.build_app_db
+
+run: ## Launch the Streamlit app
+	$(POETRY) streamlit run recipe_app/streamlit_app.py
+
 security: ## Run security checks with bandit
 	@echo "🔒 Running security checks..."
 	$(POETRY) bandit -r $(SRC_DIRS)
@@ -54,5 +63,5 @@ clean: ## Remove all cache and build files
 	find . -name '.DS_Store' -exec rm -f {} \;
 
 
-all: format lint-fix check-types test security update clean
+all: format lint-fix check-types test update security clean
 	@echo "✅ All tests passed successfully! 🎉"

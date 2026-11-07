@@ -17,16 +17,23 @@ An intelligent recipe recommendation system that helps you discover new recipes 
 recipe-recommender/
 ├── data/                    # Data files and processing
 │   ├── __init__.py
-│   ├── data_processor.py    # Data processing and DuckDB integration
+│   ├── data_processor.py    # Streams the CSV through the cleaning rules into DuckDB
+│   ├── cleaning.py          # Cleaning rules (ingredients, times, labels, meal types)
 │   ├── full_dataset.csv     # Raw dataset (not versioned, see below for sources)
-│   └── recipes.db           # Processed SQLite database (generated)
-├── streamlit/               # Web interface
+│   ├── build_app_db.py      # Builds the lean, search-indexed app database
+│   ├── recipes.db           # Full processed DuckDB database (generated)
+│   └── recipes_app.db       # Lean database the app reads (generated)
+├── recipe_app/              # Web interface
 │   ├── __init__.py
 │   ├── streamlit_app.py     # Main Streamlit application
-│   └── main.py              # Core application logic
-├── tests/                   # Unit and integration tests
-│   ├── __init__.py
-│   └── test_data.py         # Test cases for data processing
+│   ├── ui_helpers.py        # Formatting helpers for the UI
+│   └── main.py              # Search logic (DuckDB queries)
+├── tests/                   # Unit tests
+│   ├── conftest.py          # Builds a tiny test database
+│   ├── test_main.py         # Search logic tests
+│   ├── test_cleaning.py     # Cleaning rule tests
+│   ├── test_data_processor.py  # CSV -> database -> app end-to-end test
+│   └── test_streamlit_helpers.py
 ├── .gitignore
 ├── Makefile                 # Project automation
 ├── pyproject.toml           # Project metadata and dependencies
@@ -91,16 +98,41 @@ Place your dataset in `data/full_dataset.csv` with these recommended columns:
 
 4. **Process the data**
    ```bash
-   # Process with default settings (may take 10-30 minutes for large datasets)
+   # Full dataset (about 10-15 minutes, under 1 GB of RAM)
    poetry run python -m data.data_processor
-   
-   # For large datasets, you can process a subset first:
-   poetry run python -m data.data_processor --limit 10000
-   ```
 
-5. **Launch the application**
+   # Quick development run on a subset
+   poetry run python -m data.data_processor --limit 10000 --db-path data/recipes_dev.db
+   ```
+   Cleaning rules live in `data/cleaning.py`:
+   - ingredient names come from the dataset's `NER` column, with a fallback
+     parser for lines `NER` missed (so e.g. "1 1/2 lb. round steak" still counts)
+   - cooking times are estimated from durations written in the directions
+   - dietary labels use whole-word matching with exceptions (eggplant, peanut
+     butter, coconut milk, butternut squash, ...)
+   - meal type comes from the title, falling back to the ingredients
+   - duplicate recipes (same title and ingredients) are removed
+
+   The processor refuses to overwrite an existing database unless you pass
+   `--overwrite`.
+
+5. **Build the app database**
    ```bash
-   poetry run streamlit run streamlit/streamlit_app.py
+   poetry run python -m data.build_app_db   # or: make app-db
+   # from another database:
+   poetry run python -m data.build_app_db --source data/recipes_dev.db --output data/recipes_app_dev.db
+   ```
+   This copies only the columns the app uses from `data/recipes.db` into
+   `data/recipes_app.db` and adds an ingredient lookup index (about 1 minute
+   and under 3 GB of RAM for the full 2.2M recipes). After this, the app only
+   needs `recipes_app.db`; `recipes.db` and `full_dataset.csv` can be archived.
+
+6. **Launch the application**
+   ```bash
+   poetry run streamlit run recipe_app/streamlit_app.py
+
+   # or point the app at a different app database:
+   RECIPE_DB=data/recipes_app_dev.db poetry run streamlit run recipe_app/streamlit_app.py
    ```
    The app will be available at [http://localhost:8501](http://localhost:8501)
 

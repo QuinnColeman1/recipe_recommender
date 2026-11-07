@@ -6,7 +6,7 @@ authors = ["Your Name <you@example.com>"]
 license = "MIT"
 readme = "README.md"
 packages = [
-    { include = "streamlit", from = "." }
+    { include = "recipe_app", from = "." }
 ]
 
 [build-system]
@@ -25,6 +25,7 @@ ruff = "^0.13.2"
 bandit = "^1.8.6"
 mypy = "^1.18.2"
 no-implicit-optional = "^1.4"
+pypika = "^0.51.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
